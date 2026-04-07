@@ -5,6 +5,10 @@ services:
     plan: free
     buildCommand: |
       pip install --upgrade pip setuptools wheel
+      # Ensure Rust/cargo cache dirs are writable in Render build environment
+      export CARGO_HOME=/tmp/.cargo
+      export RUSTUP_HOME=/tmp/.rustup
+      mkdir -p "$CARGO_HOME" "$RUSTUP_HOME"
       pip install --prefer-binary numpy==1.24.4
       pip install --prefer-binary -r requirements.txt
     startCommand: gunicorn -k uvicorn.workers.UvicornWorker api.main:app --bind 0.0.0.0:$PORT
