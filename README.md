@@ -126,3 +126,25 @@ This README is intended to be both an onboarding guide and a high-level design d
 - Add a CONTRIBUTING.md and CODE_OF_CONDUCT.
 - Create a minimal GitHub Actions workflow for CI that runs `pytest` on pushes.
 - Scaffold an ingestion script to rebuild `data/bm25_index/corpus.json` from raw job sources.
+
+Deploying to Render
+-------------------
+
+This repository is configured to deploy on Render using the Python environment (no Docker required).
+
+Quick steps (GitHub → Render):
+
+1. Push your `main` branch to GitHub (already done).
+2. On Render, create a new Web Service and connect your GitHub repository.
+3. If Render detects `render.yaml` it will use that manifest; otherwise configure manually:
+	- Environment: `Python`
+	- Build Command: `pip install -r requirements.txt`
+	- Start Command: `gunicorn -k uvicorn.workers.UvicornWorker api.main:app --bind 0.0.0.0:$PORT`
+4. Add environment variables (API keys, embedder credentials) in the Render dashboard (Settings → Environment).
+
+Notes & Recommendations
+-----------------------
+- Do NOT commit PII or large vector DB files to the repository — keep them in secure storage and mount or restore them at deploy time.
+- For production, increase Gunicorn workers and enable health checks, logging, and monitoring on Render.
+- Store secrets in Render environment variables (do not commit a `.env`).
+
