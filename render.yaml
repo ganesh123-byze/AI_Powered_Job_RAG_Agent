@@ -3,7 +3,10 @@ services:
     name: Job RAG Agent
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      pip install --upgrade pip setuptools wheel
+      pip install --prefer-binary numpy==1.24.4
+      pip install --prefer-binary -r requirements.txt
     startCommand: gunicorn -k uvicorn.workers.UvicornWorker api.main:app --bind 0.0.0.0:$PORT
     envVars:
       - key: PYTHONUNBUFFERED
