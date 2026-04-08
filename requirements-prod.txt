@@ -1,31 +1,25 @@
-#"""Production Requirements for Render (no Rust/C build deps)"""
-
 # Core dependencies
 google-generativeai==0.8.3
-chromadb==0.5.23
+chromadb==0.4.24
 pdfplumber==0.11.4
 fastapi==0.115.6
-uvicorn==0.32.1
 requests==2.32.3
 python-dotenv==1.0.1
 pydantic==2.11.3
 duckduckgo-search==6.3.7
 
-# Hybrid search dependencies
+# Hybrid search
 rank-bm25==0.2.2
 numpy==1.24.4
 scikit-learn==1.5.1
 
-# OpenRouter API
+# APIs
 httpx==0.28.1
 openrouter==0.7.11
 
-# Production server
+# Server
 uvicorn[standard]==0.32.1
 gunicorn==23.0.0
 
-# Tokenizers (Rust-based, pin to version with wheels for Python 3.14)
-tokenizers==0.15.1
-
-# Utilities
-python-dotenv>=1.0.1
+# CRITICAL: safe prebuilt version (no Rust build)
+tokenizers==0.15.2

@@ -1,28 +1,26 @@
 """
 scorer.py  –  Hybrid Scorer with Multi-Signal Experience Inference
 ===================================================================
-Key change vs old version:
-  _score_experience() is replaced by exp_inference.infer_experience()
-  which uses a 4-layer tiered system:
-    1. Title tokens          (confidence 0.55–0.75)
-    2. Adzuna snippet regex  (confidence 0.70)
-    3. Full JD page fetch    (confidence 0.90–0.95)  — only when uncertain
-    4. Confidence-weighted match score
+Experience scoring is now handled by exp_inference.infer_experience()
+which implements a 4-layer tiered system:
 
-  Jobs with evidence_source="none" / confidence < 0.25 get a neutral
-  score of 0.50 instead of a hard rejection.
+  1. Title token scan        confidence 0.50–0.75
+  2. Adzuna snippet regex    confidence 0.70
+  3. Destination-page fetch  confidence 0.85–0.95  (only when uncertain)
+  4. Confidence-weighted match + neutral fallback
 
-Everything else (skill scoring, location, freshness, hybrid retrieval)
-is unchanged from the previous update.
+Jobs with no evidence get score=0.50 (neutral) and are NOT excluded.
+Only high-confidence mismatches (conf >= 0.80) are excluded.
+
+Everything else (skill scoring, location, freshness, BM25+vector retrieval)
+is unchanged.
 """
 
 import re
 from typing import Optional
 
 from agents.agents import extract_jd_skills
-from utils.skill_matcher import (
-    skills_match, normalize_skill, get_skill_tokens, find_matched_skills,
-)
+from utils.skill_matcher import skills_match, normalize_skill, find_matched_skills
 from utils.exp_inference import infer_experience, clear_url_cache
 from config import SCORE_WEIGHTS
 from models.job import JobListing, MatchResult, ScoreBreakdown, SkillGap
@@ -33,31 +31,22 @@ from utils.chroma_client import get_job_collection
 from utils.embedder import embed_for_retrieval, build_resume_query_text
 from utils.freshness import get_freshness_score
 
-# ---------------------------------------------------------------------------
 TOP_K_RETRIEVE = 50
 TOP_K_RETURN   = 10
-# ---------------------------------------------------------------------------
 
 
-# ── Skill matching helpers ──────────────────────────────────────────────────
+# ── Skill helpers ──────────────────────────────────────────────────────────
 
 def _normalise(s: str) -> str:
     return normalize_skill(s)
 
-def _skills_match(r: str, j: str) -> bool:
-    return skills_match(r, j)
-
 def _jd_skill_in_resume(jd: str, resume: list[str]) -> bool:
     return any(skills_match(jd, r) for r in resume)
-
-
-# ── Skill overlap scoring ───────────────────────────────────────────────────
 
 def _extract_jd_skills(jd_text: str) -> list[str]:
     try:
         skills = extract_jd_skills(jd_text)
-        if skills:
-            return skills
+        if skills: return skills
     except Exception:
         pass
     try:
@@ -65,7 +54,6 @@ def _extract_jd_skills(jd_text: str) -> list[str]:
         return extract_skills_heuristically(jd_text)
     except Exception:
         return []
-
 
 def _score_skill_overlap(
     resume_skills: list[str],
@@ -78,14 +66,12 @@ def _score_skill_overlap(
 
     if not jd_skills:
         jd_lower = job_description.lower()
-        matched = [s for s in resume_skills
-                   if _normalise(s) in jd_lower or s.lower() in jd_lower]
-        score = len(matched) / max(len(resume_skills), 1)
-        missing = [s for s in jd_skills if s not in matched]
-        return round(min(score, 1.0), 4), matched, missing
+        matched  = [s for s in resume_skills
+                    if _normalise(s) in jd_lower or s.lower() in jd_lower]
+        score    = len(matched) / max(len(resume_skills), 1)
+        return round(min(score, 1.0), 4), matched, []
 
     matched_resume, jd_gaps = find_matched_skills(resume_skills, jd_skills)
-
     jd_covered = len(jd_skills) - len(jd_gaps)
     score_a = jd_covered / max(len(jd_skills), 1)
     score_b = len(matched_resume) / max(len(resume_skills), 1)
@@ -102,14 +88,14 @@ def _score_skill_overlap(
 # ── Location scoring ────────────────────────────────────────────────────────
 
 _CITY_VARIANTS: dict[str, list[str]] = {
-    "hyderabad": ["hyderabad", "hyd", "telangana", "secunderabad"],
-    "bangalore": ["bangalore", "bengaluru", "banglore", "karnataka"],
-    "mumbai":    ["mumbai", "bombay", "maharashtra"],
-    "delhi":     ["delhi", "new delhi", "ncr", "gurgaon", "gurugram", "noida"],
-    "chennai":   ["chennai", "madras", "tamil nadu"],
-    "pune":      ["pune", "pimpri"],
-    "kolkata":   ["kolkata", "calcutta"],
-    "remote":    ["remote", "work from home", "wfh", "anywhere", "pan india"],
+    "hyderabad": ["hyderabad","hyd","telangana","secunderabad"],
+    "bangalore": ["bangalore","bengaluru","banglore","karnataka"],
+    "mumbai":    ["mumbai","bombay","maharashtra"],
+    "delhi":     ["delhi","new delhi","ncr","gurgaon","gurugram","noida"],
+    "chennai":   ["chennai","madras","tamil nadu"],
+    "pune":      ["pune","pimpri"],
+    "kolkata":   ["kolkata","calcutta"],
+    "remote":    ["remote","work from home","wfh","anywhere","pan india"],
 }
 
 def _city_canonical(loc: str) -> str:
@@ -121,9 +107,8 @@ def _city_canonical(loc: str) -> str:
 
 def _score_location(job_location: str, location_priority: list[str]) -> float:
     job_c = _city_canonical(job_location)
-    user_remotes = {"remote", "work from home", "wfh"}
-    user_wants_remote = any(l.lower().strip() in user_remotes for l in location_priority)
-    if user_wants_remote and job_c == "remote":
+    user_remotes = {"remote","work from home","wfh"}
+    if any(l.lower().strip() in user_remotes for l in location_priority) and job_c == "remote":
         return 1.0
     for i, loc in enumerate(location_priority):
         if _city_canonical(loc) == job_c:
@@ -142,14 +127,13 @@ def _compute_overall(breakdown: ScoreBreakdown) -> float:
         + breakdown.experience_alignment * w.get("experience_alignment", 0.20)
         + breakdown.location_match       * w.get("location_match", 0.15)
         + breakdown.freshness            * w.get("freshness", 0.15),
-        1.0
-    ), 4)
+        1.0), 4)
 
 def _build_skill_gaps(missing: list[str]) -> list[SkillGap]:
     return [SkillGap(missing_skill=s, resource="", micro_project="") for s in missing]
 
 
-# ── Main retrieval + scoring ────────────────────────────────────────────────
+# ── Main hybrid scoring pipeline ────────────────────────────────────────────
 
 def retrieve_and_score_hybrid(
     profile: ResumeProfile,
@@ -157,9 +141,9 @@ def retrieve_and_score_hybrid(
     use_rrf: bool = True,
     debug: bool = False,
 ) -> list[MatchResult]:
-    """Full hybrid pipeline → returns top 10 unique results."""
+    """Full pipeline: hybrid retrieval → 4-layer experience inference → top 10."""
 
-    clear_url_cache()   # fresh URL cache per run
+    clear_url_cache()
 
     print("\n[STEP] Initialising hybrid search…")
     chroma_collection = get_job_collection()
@@ -168,14 +152,14 @@ def retrieve_and_score_hybrid(
     metas = all_jobs.get("metadatas") or []
 
     if not docs:
-        print("  ⚠ ChromaDB empty — no jobs to score.")
+        print("  ⚠ ChromaDB empty.")
         return []
 
     bm25_manager = BM25IndexManager()
     bm25_manager.build_from_chroma(all_jobs)
 
     skill_count = len(profile.skills or [])
-    bm25_w  = 0.6 if skill_count >= 8 else 0.4
+    bm25_w   = 0.6 if skill_count >= 8 else 0.4
     vector_w = 1.0 - bm25_w
 
     retriever = HybridRetriever(
@@ -203,9 +187,8 @@ def retrieve_and_score_hybrid(
         print("  ⚠ Hybrid retriever returned 0 results.")
         return []
 
-    print(f"\n  Retrieved {len(hybrid_results)} candidates → scoring…")
+    print(f"  Retrieved {len(hybrid_results)} candidates → scoring…")
 
-    # Small pre-rank boost for title/company meta overlap
     def _meta_overlap(skills, text):
         if not skills: return 0.0
         tl = text.lower()
@@ -218,14 +201,13 @@ def retrieve_and_score_hybrid(
         r.hybrid_score = round(r.hybrid_score + 0.08 * _meta_overlap(profile.skills, meta_text), 4)
     hybrid_results.sort(key=lambda r: r.hybrid_score, reverse=True)
 
-    # ── Score each candidate ────────────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"SCORING {len(hybrid_results)} candidates")
     print(f"{'='*60}")
 
-    # Determine if we should fetch full JDs (skip for obvious high-confidence cases)
-    # Fetch only if we haven't already retrieved enough high-confidence results
-    fetch_budget = 15    # max destination-page fetches per pipeline run
+    # Budget: max destination-page fetches per pipeline run
+    # Budget is per-run to avoid pipeline timeout on large result sets
+    fetch_budget = 15
     fetch_count  = 0
 
     match_results: list[MatchResult] = []
@@ -233,62 +215,55 @@ def retrieve_and_score_hybrid(
     for i, hr in enumerate(hybrid_results, 1):
         job_idx   = hr.job_index
         full_desc = docs[job_idx] if job_idx < len(docs) else ""
-        meta      = metas[job_idx] if job_idx < len(metas) else {}
 
         print(f"\n  [{i}/{len(hybrid_results)}] {hr.title} @ {hr.company}")
-        print(f"    Hybrid: {hr.hybrid_score:.4f}  (BM25:{hr.bm25_score:.4f} Vec:{hr.vector_score:.4f})")
+        print(f"    Hybrid: {hr.hybrid_score:.4f}  BM25:{hr.bm25_score:.4f}  Vec:{hr.vector_score:.4f}")
 
-        # ── Skill score ───────────────────────────────────────────────
-        skill_score, matched, missing = _score_skill_overlap(
-            profile.skills, full_desc
-        )
+        # ── Skill score ─────────────────────────────────────────────────
+        skill_score, matched, missing = _score_skill_overlap(profile.skills, full_desc)
 
-        # ── Experience score (4-layer inference) ──────────────────────
-        # Decide whether to spend a fetch slot on this job
+        # ── Experience inference (4-layer) ──────────────────────────────
+        # Fetch budget: spend slots on top candidates only
         do_fetch = fetch_count < fetch_budget
 
-        exp_result = infer_experience(
+        exp = infer_experience(
             title=hr.title,
-            snippet=full_desc[:1500],       # Adzuna snippet stored in chroma
-            redirect_url=hr.apply_url,
+            snippet=full_desc[:2000],    # Adzuna snippet stored in ChromaDB
+            redirect_url=hr.apply_url,   # for full JD fetch when uncertain
             user_level=preferences.experience_level,
             candidate_years=profile.experience_years,
             fetch_full_jd=do_fetch,
         )
 
-        if exp_result.signal.evidence_source in ("full_jd", "full_jd_phrase"):
+        if exp.signal.evidence_source in ("full_jd", "full_jd_phrase"):
             fetch_count += 1
 
-        exp_score = exp_result.score
+        print(f"    ExpInfer : label={exp.label:7} conf={exp.confidence:.2f}"
+              f"  match={exp.is_match}  src={exp.signal.evidence_source}")
+        print(f"    ExpReason: {exp.reason[:80]}")
 
-        print(f"    ExpInfer : label={exp_result.label}  conf={exp_result.confidence:.2f}"
-              f"  match={exp_result.is_match}  src={exp_result.signal.evidence_source}")
-        print(f"    ExpReason: {exp_result.reason[:80]}")
-
-        # ── Skip hard mismatches with high confidence ─────────────────
-        if not exp_result.is_match and exp_result.confidence >= 0.80:
-            print(f"    ✗ Excluded — strong exp mismatch (conf={exp_result.confidence:.2f})")
+        # Exclude only high-confidence strong mismatches
+        if not exp.is_match and exp.confidence >= 0.80:
+            print(f"    ✗ Excluded — strong exp mismatch (conf={exp.confidence:.2f})")
             continue
 
-        # ── Location + freshness ──────────────────────────────────────
+        # ── Location + freshness ─────────────────────────────────────────
         loc_score   = _score_location(hr.location, preferences.location_priority)
         fresh_score = get_freshness_score(hr.posted_date)
 
         breakdown = ScoreBreakdown(
             skill_overlap=skill_score,
-            experience_alignment=exp_score,
+            experience_alignment=exp.score,
             location_match=loc_score,
             freshness=fresh_score,
         )
         breakdown.overall = _compute_overall(breakdown)
 
         # Blend retrieval signal (25%)
-        retrieval_norm = (hr.hybrid_score / max_hybrid) if max_hybrid > 0 else 0.0
-        breakdown.overall = round(
-            min(0.75 * breakdown.overall + 0.25 * retrieval_norm, 1.0), 4
-        )
+        retrieval_norm  = (hr.hybrid_score / max_hybrid) if max_hybrid > 0 else 0.0
+        breakdown.overall = round(min(0.75 * breakdown.overall + 0.25 * retrieval_norm, 1.0), 4)
 
-        # Skip truly irrelevant (zero skill overlap AND very low retrieval)
+        # Skip zero-skill-overlap + zero-meta-overlap + very low retrieval
         meta_text = f"{hr.title} {hr.company} {hr.location}"
         if (skill_score <= 0.0
                 and _meta_overlap(profile.skills, meta_text) == 0.0
@@ -297,15 +272,10 @@ def retrieve_and_score_hybrid(
             continue
 
         job = JobListing(
-            job_id=hr.job_id,
-            title=hr.title,
-            company=hr.company,
-            location=hr.location,
-            description=full_desc,
-            posted_date=hr.posted_date,
-            apply_url=hr.apply_url,
-            salary_min=hr.salary_min,
-            salary_max=hr.salary_max,
+            job_id=hr.job_id, title=hr.title, company=hr.company,
+            location=hr.location, description=full_desc,
+            posted_date=hr.posted_date, apply_url=hr.apply_url,
+            salary_min=hr.salary_min, salary_max=hr.salary_max,
             freshness_bucket=hr.freshness_bucket,
         )
 
@@ -316,8 +286,7 @@ def retrieve_and_score_hybrid(
             missing_skills=_build_skill_gaps(missing),
             explanation=(
                 f"Hybrid:{hr.hybrid_score:.4f} | "
-                f"Exp:{exp_result.label}(conf={exp_result.confidence:.2f},"
-                f"src={exp_result.signal.evidence_source})"
+                f"Exp:{exp.label}(conf={exp.confidence:.2f},src={exp.signal.evidence_source})"
             ),
         ))
 
@@ -325,7 +294,7 @@ def retrieve_and_score_hybrid(
     top10 = match_results[:TOP_K_RETURN]
 
     print(f"\n{'='*60}")
-    print(f"✅ {len(top10)} top jobs returned  (fetch_count={fetch_count})")
+    print(f"✅ {len(top10)} top jobs returned  (exp_fetches={fetch_count}/{fetch_budget})")
     print(f"{'='*60}")
     for i, r in enumerate(top10, 1):
         print(f"  {i:>2}. {r.job.title} @ {r.job.company}"
@@ -340,4 +309,5 @@ def retrieve_and_score(
     profile: ResumeProfile,
     preferences: UserPreferences,
 ) -> list[MatchResult]:
+    """Backward-compatible wrapper."""
     return retrieve_and_score_hybrid(profile, preferences, use_rrf=True, debug=False)
