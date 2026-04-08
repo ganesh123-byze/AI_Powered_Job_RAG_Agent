@@ -1,15 +1,15 @@
 services:
   - type: web
     name: job-rag-agent
-    env: python
-    plan: free
-
-    buildCommand: |
-      pip install --upgrade pip setuptools wheel
-      pip install --only-binary=:all: -r requirements-prod.txt
-
-    startCommand: gunicorn -k uvicorn.workers.UvicornWorker api.main:app --bind 0.0.0.0:$PORT
-
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT --workers 1 --timeout-keep-alive 180
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"
+      # Add your secrets in the Render dashboard → Environment tab:
+      # OPENROUTER_API_KEY
+      # ADZUNA_APP_ID
+      # ADZUNA_API_KEY
